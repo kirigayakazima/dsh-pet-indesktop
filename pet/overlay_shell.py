@@ -880,6 +880,12 @@ class ShellOverlayWindow(OverlayWindow):
             if callable(route_spin) and route_spin(grab):
                 return
             clicked = behavior.on_sprite_clicked(grab)
+            try:
+                _sh = getattr(getattr(self, '_instance', None), 'shell', None)
+                if _sh and hasattr(_sh, '_fullawake_bridge'):
+                    _sh._fullawake_bridge.observe_interaction('click')
+            except Exception:
+                pass
             squash = getattr(grab, "squash", None)
             if callable(squash):
                 squash()  # 4.1c 点击 Q 弹（window.py:3473 语义）

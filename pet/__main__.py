@@ -169,7 +169,9 @@ def _main() -> int:
     if "--ocr-worker" in sys.argv:
         return _run_ocr_worker()
     from .app import main as app_main
-    return app_main()
+    enable_chat = '--no-chat' not in sys.argv
+    clean_argv = [a for a in sys.argv if a != '--no-chat']
+    return app_main(clean_argv, enable_chat=enable_chat)
 
 
 if __name__ == "__main__":

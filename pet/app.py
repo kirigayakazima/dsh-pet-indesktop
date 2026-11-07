@@ -5293,6 +5293,12 @@ def main(argv: list[str] | None = None, enable_chat: bool = True) -> int:
                               spawn_offset=_read_spawn_offset_env(), overlay_gate=overlay_gate)
         try:
             controller.start()
+            try:
+                from .fullawake_bridge import FullAwakePetBridge
+                controller._fullawake_bridge = FullAwakePetBridge(controller)
+                logging.info('FullAwakePetBridge 成功挂载至 AppShell')
+            except Exception as bridge_exc:
+                logging.warning('FullAwakePetBridge 初始化警告: %s', bridge_exc)
         except Exception as exc:
             logging.exception("启动失败")
             _show_startup_error("dsh-pet-standalone", str(exc))
