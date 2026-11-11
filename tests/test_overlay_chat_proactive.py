@@ -457,6 +457,21 @@ def test_link_anim_requests_reach_behavior_controller(tmp_path):
         shell._delete_runtime_marker()
 
 
+def test_interrupt_link_animation_replaces_active_and_pending_action(tmp_path):
+    shell, _lib = fac._make_shell(tmp_path)
+    try:
+        shell.overlay.show()
+        shell.request_link_anim("act1")
+        shell.request_link_anim("act1")
+        assert shell.sprite._clip_name == "act1"
+        assert shell._pending_link_anim == "act1"
+        shell.request_link_anim("idle1", interrupt=True)
+        assert shell.sprite._clip_name == "idle1"
+        assert shell._pending_link_anim is None
+    finally:
+        shell._delete_runtime_marker()
+
+
 def test_link_chain_asks_provider_after_one_shot_ends(tmp_path):
     """联动动作链接续：一次性动作播完 → 问 provider 要下一个（_on_anim_ended 等价）。"""
     shell, lib = fac._make_shell(tmp_path)

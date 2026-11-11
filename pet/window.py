@@ -1753,8 +1753,8 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         """当前是否正在播一次性动作（动作池/点击回应/移动）。待机/转向可立即切换。"""
         return self.anim in self.acts or self.anim in self.clicks or self.anim in self.moves
 
-    def request_link_anim(self, name: str) -> None:
-        """Agent 联动动作请求：一次性动作播放中不打断，存为待播（最新覆盖旧的）。
+    def request_link_anim(self, name: str, *, interrupt: bool = False) -> None:
+        """排队播放联动动作，语音打断可直接接管当前动作。
 
         B7 复审 R2：新的联动请求覆盖旧的联动失败重试（同一请求流，最新
         覆盖旧的），避免旧重试在 1.5s 后顶掉新联动动作。
@@ -1764,7 +1764,7 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         if self._pending_switch_link:
             self._cancel_pending_switch_retry()
         self._pending_link_anim = name
-        if not self._is_one_shot_playing():
+        if interrupt or not self._is_one_shot_playing():
             self._play_pending_link_anim()
 
     def _play_pending_link_anim(self) -> None:

@@ -3694,14 +3694,14 @@ class OverlayShell(QObject):
             logging.debug("overlay: 切换动画失败 %s", name, exc_info=True)
             return False
 
-    def request_link_anim(self, name: str) -> None:
-        """Agent 联动动作请求：一次性动作播放中不打断，存为待播（最新覆盖旧的）。"""
+    def request_link_anim(self, name: str, *, interrupt: bool = False) -> None:
+        """排队播放联动动作，语音打断可直接接管当前动作。"""
         self.mark_activity()
         name = str(name or "")
         if not name:
             return
         self._pending_link_anim = name
-        if not self._link_anim_busy():
+        if interrupt or not self._link_anim_busy():
             self._play_pending_link_anim()
 
     def _play_pending_link_anim(self) -> None:

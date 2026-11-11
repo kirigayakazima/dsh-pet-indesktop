@@ -84,6 +84,7 @@ class FullAwakePetBridge(QObject):
         self.player.mediaStatusChanged.connect(self._on_media_status)
 
         self.current_utterance = ""
+        self.bridged = False
         self.envelope: MouthEnvelope | None = None
         self.buffer: QBuffer | None = None
         self.current_mouth = 0
@@ -141,24 +142,47 @@ class FullAwakePetBridge(QObject):
             self._handle_action(event)
         elif ev_type == "playback_audio":
             self._handle_playback_audio(event)
+        elif ev_type == "interrupt":
+            self._handle_interrupt(event)
         elif ev_type == "playback_clock" and event.get("mode") == "idle":
             self.stop_audio()
             target = self._get_target()
             if target and hasattr(target, "request_link_idle"):
                 target.request_link_idle()
 
+    def _handle_interrupt(self, event: dict):
+        utterance = event.get("utteranceId")
+        interrupt_id = event.get("interruptId")
+        if not utterance or not interrupt_id or self.current_utterance not in ("", utterance):
+            return
+        position = self.player.position() if self.current_utterance else 0
+        self.stop_audio()
+        self.socket.sendTextMessage(json.dumps({
+            "event": "interrupt_ack", "interruptId": interrupt_id,
+            "utteranceId": utterance, "elapsedAudioMs": position,
+        }))
+        target = self._get_target()
+        if target and hasattr(target, "request_link_anim"):
+            target.request_link_anim("东张西望", interrupt=True)
+
     def _handle_action(self, event: dict):
         text = event.get("text", "")
         intent = event.get("intent", "talk")
         duration_ms = event.get("durationMs", 3500)
         self.current_utterance = event.get("utteranceId", "")
+        self.bridged = event.get("voiceBridge") is True
 
         target = self._get_target()
         if not target:
+            if event.get("bridgeText"):
+                self._send_clock("idle", outcome="discarded")
             return
 
+        shown = False
         if text and hasattr(target, "show_bubble"):
-            target.show_bubble(text, duration_ms=duration_ms)
+            shown = target.show_bubble(text, duration_ms=duration_ms)
+        if event.get("bridgeText"):
+            self._send_clock("idle", outcome="text_delivered" if shown is True else "discarded")
 
         # 触发匹配的动作
         candidates = INTENT_ANIM_CANDIDATES.get(intent, ["悠闲哼歌"])
@@ -185,17 +209,22 @@ class FullAwakePetBridge(QObject):
             self.player.play()
         except Exception as exc:
             log.error("Failed to decode and play audio: %s", exc)
+            if self.bridged:
+                self._send_clock("idle", outcome="discarded")
             self.stop_audio()
 
     def _on_media_status(self, status):
         if status in (QMediaPlayer.MediaStatus.EndOfMedia, QMediaPlayer.MediaStatus.InvalidMedia):
-            self._send_clock("idle")
+            played = status == QMediaPlayer.MediaStatus.EndOfMedia and self.buffer is not None
+            self._send_clock("idle", outcome=("played" if played else "discarded") if self.bridged else None)
             self.stop_audio()
             target = self._get_target()
             if target and hasattr(target, "request_link_idle"):
                 target.request_link_idle()
 
     def stop_audio(self):
+        self.current_utterance = ""
+        self.bridged = False
         self.envelope = None
         self.current_mouth = 0
         if self.buffer is not None:
@@ -212,7 +241,7 @@ class FullAwakePetBridge(QObject):
         else:
             self.current_mouth = 0
 
-    def _send_clock(self, mode: str, pos: int = 0):
+    def _send_clock(self, mode: str, pos: int = 0, *, outcome=None):
         if self.current_utterance and self.socket.state() == QAbstractSocket.SocketState.ConnectedState:
             payload = {
                 "event": "playback_clock",
@@ -221,6 +250,8 @@ class FullAwakePetBridge(QObject):
                 "positionMs": pos,
                 "mouth": self.current_mouth,
             }
+            if outcome is not None:
+                payload["outcome"] = outcome
             self.socket.sendTextMessage(json.dumps(payload))
 
     def observe_interaction(self, action_type: str, details: dict | None = None):
