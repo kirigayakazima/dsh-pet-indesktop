@@ -2821,7 +2821,14 @@ class AppShell:
             callbacks = {a: cb for a, cb in callbacks.items()
                          if a not in _VISION_HOTKEY_ACTIONS}
         try:
-            failures = service.apply(bindings, callbacks)
+            bridge = getattr(self, '_fullawake_bridge', None)
+            interrupt_key = os.environ.get('FULLAWAKE_INTERRUPT_HOTKEY', '').strip()
+            if bridge and interrupt_key:
+                bindings['fullawake_interrupt'] = interrupt_key
+                callbacks['fullawake_interrupt'] = bridge.request_interrupt
+                failures = service.apply(bindings, callbacks, runtime_actions=('fullawake_interrupt',))
+            else:
+                failures = service.apply(bindings, callbacks)
         except Exception:
             logging.exception("注册全局快捷键失败（右键菜单仍可用）")
             return
@@ -5296,6 +5303,8 @@ def main(argv: list[str] | None = None, enable_chat: bool = True) -> int:
             try:
                 from .fullawake_bridge import FullAwakePetBridge
                 controller._fullawake_bridge = FullAwakePetBridge(controller)
+                if os.environ.get('FULLAWAKE_INTERRUPT_HOTKEY'):
+                    controller._apply_global_hotkeys()
                 logging.info('FullAwakePetBridge 成功挂载至 AppShell')
             except Exception as bridge_exc:
                 logging.warning('FullAwakePetBridge 初始化警告: %s', bridge_exc)

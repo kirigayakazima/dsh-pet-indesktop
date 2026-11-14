@@ -156,6 +156,18 @@ def test_wm_hotkey_for_unknown_id_is_ignored():
     assert handled is False, "别人的热键 id 不许吞"
 
 
+def test_runtime_playback_hotkey_dispatches_without_a_persisted_binding(qapp_):
+    user32 = _FakeUser32()
+    service = GlobalHotkeyService(app=qapp_, user32=user32, install_native_filter=False, supported=True)
+    fired = []
+    action = 'fullawake_interrupt'
+    assert not service.apply({action: 'Ctrl+Alt+F9'}, {action: lambda: fired.append(action)}, runtime_actions=(action,))
+    assert _feed_hotkey(service, next(iter(user32.registered)))[0]
+    qapp_.processEvents()
+    assert fired == [action]
+    service.clear()
+
+
 # ---------------------------------------------------------------- 设置页接线
 def test_chord_to_text_requires_a_modifier_and_known_key():
     """录入控件只收「修饰键 + 白名单按键」，其余返回空串（= 不绑）。"""

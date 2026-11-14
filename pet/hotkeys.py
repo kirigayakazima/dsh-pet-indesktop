@@ -153,7 +153,8 @@ class GlobalHotkeyService(QObject, QAbstractNativeEventFilter):
 
     # ------------------------------------------------------------ 绑定
     def apply(self, bindings: dict[str, str],
-              callbacks: dict[str, Callable[[], None]]) -> list[tuple[str, str, str]]:
+              callbacks: dict[str, Callable[[], None]], *,
+              runtime_actions: tuple[str, ...] = ()) -> list[tuple[str, str, str]]:
         """按 ``bindings`` 重设全部热键；返回失败项 ``(动作, 文本, 原因)``。
 
         每次都是「全量重设」：先注销旧的再按新表注册，避免"改键后旧键还活着"。
@@ -164,7 +165,7 @@ class GlobalHotkeyService(QObject, QAbstractNativeEventFilter):
         if not self._supported:
             return []
         failures: list[tuple[str, str, str]] = []
-        for index, (action, key) in enumerate(ACTIONS.items()):
+        for index, action in enumerate((*ACTIONS, *runtime_actions)):
             text = str((bindings or {}).get(action) or "").strip()
             if not text:
                 continue

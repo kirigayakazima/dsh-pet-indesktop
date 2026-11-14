@@ -12,43 +12,24 @@
 from __future__ import annotations
 
 import base64
-from io import BytesIO
 import json
 import logging
-import math
 import os
+import re
 import time
-import wave
-from array import array
 
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QObject, QTimer, QUrl, Qt
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWebSockets import QWebSocket
 from PySide6.QtNetwork import QAbstractSocket
+from PySide6.QtWidgets import QLabel, QWidget
+from shiboken6 import isValid
+
+from .bridge.crash_guard import CrashGuard
+from .bridge.intent_smoother import AnimationSmoother, Priority
+from .bridge.sync_clock import PlaybackClock
 
 log = logging.getLogger("fullawake-bridge")
-
-
-class MouthEnvelope:
-    def __init__(self, data: bytes):
-        with wave.open(BytesIO(data), "rb") as wav:
-            self.samples = array("h", wav.readframes(wav.getnframes()))
-            self.samples_per_ms = wav.getframerate() * wav.getnchannels() / 1000.0
-        self.level = 0
-        self.rms = 0.0
-
-    def at(self, position_ms: int) -> int:
-        start = int(max(0, position_ms - 16) * self.samples_per_ms)
-        end = int((position_ms + 16) * self.samples_per_ms)
-        samples = self.samples[start:end]
-        if not samples:
-            return 0
-        rms = math.sqrt(sum(s * s for s in samples) / len(samples)) / 32768.0
-        self.rms += (rms - self.rms) * (0.55 if rms > self.rms else 0.24)
-        low = 0.018 if self.level == 0 else 0.012
-        high = 0.055 if self.level == 2 else 0.08
-        self.level = 2 if self.rms >= high else 1 if self.rms >= low else 0
-        return self.level
 
 
 # Intent 到角色动作的映射表（按 shenshen 实际具备的 100+ webm 动画名映射）
@@ -59,9 +40,19 @@ INTENT_ANIM_CANDIDATES = {
     "talk": ["悠闲哼歌", "深度思考碎碎念"],
     "curious": ["东张西望"],
     "surprised": ["被吓一跳", "点击回应-害羞惊讶"],
+    "shock": ["被吓一跳"],
+    "smile": ["点击回应-开心跃动"],
+    "wave": ["点击回应-元气挥手"],
     "sleep": ["原地小憩沉眠", "打瞌睡被惊醒"],
     "eat": ["吃Token", "吃冰淇淋融化"],
     "praise": ["放烟花", "凭空生花", "点击回应-开心跃动"],
+}
+
+MOOD_IDLE_CLIPS = {
+    "tired": "原地小憩沉眠",
+    "cheerful": "悠闲哼歌",
+    "excited": "轻快摇摆舞",
+    "engaged": "工作状态-思考冒泡",
 }
 
 
@@ -70,7 +61,7 @@ class FullAwakePetBridge(QObject):
         super().__init__()
         self.shell = app_shell
         self.port = int(os.environ.get("FULLAWAKE_PORT", port))
-        self.url = QUrl(f"ws://127.0.0.1:{self.port}/ws/pet?player=1")
+        self.url = QUrl(f"ws://127.0.0.1:{self.port}/ws/pet?player=1&heartbeat=1")
 
         self.socket = QWebSocket(parent=self)
         self.socket.setMaxAllowedIncomingMessageSize(5_000_000)
@@ -85,9 +76,16 @@ class FullAwakePetBridge(QObject):
 
         self.current_utterance = ""
         self.bridged = False
-        self.envelope: MouthEnvelope | None = None
+        self.envelope: PlaybackClock | None = None
         self.buffer: QBuffer | None = None
+        self.song_playing = False
         self.current_mouth = 0
+        self.guard = CrashGuard()
+        self.smoother = AnimationSmoother()
+        self.heart_mood = "calm"
+        self.pending_text = ""
+        self.subtitle = ""
+        self.mouth_overlay = None
 
         # 重连定时器
         self.reconnect_timer = QTimer(self)
@@ -118,7 +116,14 @@ class FullAwakePetBridge(QObject):
         if self.socket.state() == QAbstractSocket.SocketState.UnconnectedState:
             self.socket.open(self.url)
 
+    def request_interrupt(self):
+        if self.socket.state() == QAbstractSocket.SocketState.ConnectedState:
+            self.socket.sendTextMessage(json.dumps({'event': 'interrupt_request'}))
+        else:
+            self.stop_audio()
+
     def _on_connected(self):
+        self.guard.reset()
         log.info("Connected to FullAwake PC gateway (%s)", self.url.toString())
         target = self._get_target()
         if target and hasattr(target, "show_bubble"):
@@ -127,6 +132,8 @@ class FullAwakePetBridge(QObject):
     def _on_disconnected(self):
         log.warning("Disconnected from FullAwake PC gateway")
         self.stop_audio()
+        self.guard.reset()
+        self.smoother.reset()
         target = self._get_target()
         if target and hasattr(target, "request_link_idle"):
             target.request_link_idle()
@@ -137,18 +144,31 @@ class FullAwakePetBridge(QObject):
         except Exception:
             return
 
+        if not isinstance(event, dict):
+            return
         ev_type = event.get("event")
-        if ev_type == "action":
+        if ev_type == "ping":
+            self.guard.beat(time.monotonic())
+            self.socket.sendTextMessage(json.dumps({"event": "pong", "nonce": event.get("nonce")}))
+        elif ev_type == "action":
             self._handle_action(event)
+        elif ev_type == "heart_mood":
+            mood = event.get("mood")
+            if isinstance(mood, str) and (mood == "calm" or mood in MOOD_IDLE_CLIPS):
+                self.heart_mood = mood
         elif ev_type == "playback_audio":
             self._handle_playback_audio(event)
+        elif ev_type == "playback_song" and event.get("utteranceId") == self.current_utterance:
+            task = event.get("task")
+            if isinstance(task, str) and re.fullmatch(r"[a-zA-Z0-9_-]{1,60}", task) and not self.buffer and not self.song_playing:
+                self.song_playing = True
+                self.player.setSource(QUrl(f"http://127.0.0.1:{self.port}/v1/voice/sing/download/{task}?format=mp3"))
+                self.player.play()
         elif ev_type == "interrupt":
             self._handle_interrupt(event)
-        elif ev_type == "playback_clock" and event.get("mode") == "idle":
+        elif (ev_type == "playback_clock" and event.get("mode") == "idle"
+              and event.get("utteranceId") in ("", self.current_utterance)):
             self.stop_audio()
-            target = self._get_target()
-            if target and hasattr(target, "request_link_idle"):
-                target.request_link_idle()
 
     def _handle_interrupt(self, event: dict):
         utterance = event.get("utteranceId")
@@ -163,14 +183,23 @@ class FullAwakePetBridge(QObject):
         }))
         target = self._get_target()
         if target and hasattr(target, "request_link_anim"):
-            target.request_link_anim("东张西望", interrupt=True)
+            if self.smoother.request(Priority.HIGH_ALERT, time.monotonic(), 0):
+                target.request_link_anim("东张西望", interrupt=True)
 
     def _handle_action(self, event: dict):
         text = event.get("text", "")
         intent = event.get("intent", "talk")
         duration_ms = event.get("durationMs", 3500)
+        has_audio = event.get("hasAudio") is True or bool(event.get("audioBase64"))
+        if (self.buffer is not None or self.song_playing) and event.get("utteranceId") != self.current_utterance:
+            if event.get("bridgeText") and event.get("utteranceId"):
+                self._send_clock("idle", outcome="discarded", utterance=event["utteranceId"])
+            if intent in ("shock", "surprised"):
+                self._show_intent(intent, Priority.HIGH_ALERT, duration_ms)
+            return
         self.current_utterance = event.get("utteranceId", "")
         self.bridged = event.get("voiceBridge") is True
+        self.pending_text = text if has_audio else ""
 
         target = self._get_target()
         if not target:
@@ -179,19 +208,26 @@ class FullAwakePetBridge(QObject):
             return
 
         shown = False
-        if text and hasattr(target, "show_bubble"):
+        if text and not has_audio and hasattr(target, "show_bubble"):
             shown = target.show_bubble(text, duration_ms=duration_ms)
         if event.get("bridgeText"):
             self._send_clock("idle", outcome="text_delivered" if shown is True else "discarded")
 
-        # 触发匹配的动作
-        candidates = INTENT_ANIM_CANDIDATES.get(intent, ["悠闲哼歌"])
-        anim_to_play = candidates[0] if candidates else None
-        if anim_to_play and hasattr(target, "request_link_anim"):
-            target.request_link_anim(anim_to_play)
+        priority = (Priority.HIGH_ALERT if intent in ("shock", "surprised") else
+                    Priority.SPEAKING if has_audio else Priority.EMOTION)
+        self._show_intent(intent, priority, duration_ms)
 
         if event.get("audioBase64"):
             self._handle_playback_audio(event)
+
+    def _show_intent(self, intent, priority, duration_ms):
+        target = self._get_target()
+        animation = INTENT_ANIM_CANDIDATES.get(intent, ["悠闲哼歌"])[0]
+        if hasattr(target, "request_link_anim") and self.smoother.request(priority, time.monotonic(), duration_ms / 1000):
+            if priority >= Priority.SPEAKING:
+                target.request_link_anim(animation, interrupt=True)
+            else:
+                target.request_link_anim(animation)
 
     def _handle_playback_audio(self, event: dict):
         if event.get("utteranceId") != self.current_utterance:
@@ -201,11 +237,13 @@ class FullAwakePetBridge(QObject):
             return
         try:
             wav_bytes = base64.b64decode(audio_b64, validate=True)
-            self.envelope = MouthEnvelope(wav_bytes)
+            self.envelope = PlaybackClock.from_wire(event) if "visemes" in event else (
+                PlaybackClock.from_wav(wav_bytes) if event.get("mediaType") != "audio/mpeg" else None)
             self.buffer = QBuffer(self)
             self.buffer.setData(QByteArray(wav_bytes))
             self.buffer.open(QIODevice.OpenModeFlag.ReadOnly)
-            self.player.setSourceDevice(self.buffer, QUrl("memory.wav"))
+            extension = "mp3" if event.get("mediaType") == "audio/mpeg" else "wav"
+            self.player.setSourceDevice(self.buffer, QUrl(f"memory.{extension}"))
             self.player.play()
         except Exception as exc:
             log.error("Failed to decode and play audio: %s", exc)
@@ -214,39 +252,96 @@ class FullAwakePetBridge(QObject):
             self.stop_audio()
 
     def _on_media_status(self, status):
-        if status in (QMediaPlayer.MediaStatus.EndOfMedia, QMediaPlayer.MediaStatus.InvalidMedia):
+        if (self.buffer is not None or self.song_playing) and status in (QMediaPlayer.MediaStatus.EndOfMedia, QMediaPlayer.MediaStatus.InvalidMedia):
             played = status == QMediaPlayer.MediaStatus.EndOfMedia and self.buffer is not None
             self._send_clock("idle", outcome=("played" if played else "discarded") if self.bridged else None)
             self.stop_audio()
-            target = self._get_target()
-            if target and hasattr(target, "request_link_idle"):
-                target.request_link_idle()
 
     def stop_audio(self):
         self.current_utterance = ""
         self.bridged = False
         self.envelope = None
-        self.current_mouth = 0
-        if self.buffer is not None:
+        self.pending_text = self.subtitle = ""
+        self._set_mouth(0)
+        buffer, self.buffer = self.buffer, None
+        song, self.song_playing = self.song_playing, False
+        if buffer is not None or song:
             self.player.stop()
             self.player.setSource(QUrl())
-            self.buffer.deleteLater()
-            self.buffer = None
+        if buffer is not None:
+            buffer.deleteLater()
+
+    def _set_mouth(self, level):
+        self.current_mouth = level
+        if self.mouth_overlay is not None and not isValid(self.mouth_overlay):
+            self.mouth_overlay = None
+        if not level:
+            if self.mouth_overlay is not None:
+                self.mouth_overlay.hide()
+            return
+        target = self._get_target()
+        # Animated assets are flat clips. Overlay a small mouth on the active
+        # renderer without changing its clip or input hit-testing.
+        region = None
+        if not isinstance(target, QWidget) and getattr(target, "sprite", None) is not None:
+            sprite = target.sprite
+            host = target.host_for_sprite(sprite)
+            region = sprite.body_rect()
+            target = host.overlay if host is not None else None
+        if not isinstance(target, QWidget) or not isValid(target):
+            if self.mouth_overlay is not None:
+                self.mouth_overlay.hide()
+            return
+        if self.mouth_overlay is None or self.mouth_overlay.parent() is not target:
+            if self.mouth_overlay is not None:
+                self.mouth_overlay.deleteLater()
+            self.mouth_overlay = QLabel(target)
+            self.mouth_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        if region is None:
+            region = target.character_local_region() if hasattr(target, "character_local_region") else target.rect()
+        width = max(3, round(region.width() * (.035 if level == 1 else .055)))
+        height = max(2, round(width * (.45 if level == 1 else .75)))
+        if self.mouth_overlay.height() != height or not self.mouth_overlay.styleSheet():
+            self.mouth_overlay.setStyleSheet(f"background:#62343c;border-radius:{height // 2}px")
+        self.mouth_overlay.setGeometry(region.center().x() - width // 2, region.y() + round(region.height() * .40), width, height)
+        self.mouth_overlay.show()
+        self.mouth_overlay.raise_()
 
     def _on_tick(self):
-        if self.envelope and self.player.isPlaying():
+        now = time.monotonic()
+        if self.guard.expired(now):
+            self.stop_audio()
+            self.socket.abort()
+            return
+        if self.buffer is None and not self.song_playing and self.smoother.expire(now):
+            target = self._get_target()
+            clip = MOOD_IDLE_CLIPS.get(self.heart_mood)
+            if clip and hasattr(target, "request_link_anim"):
+                target.request_link_anim(clip)
+            elif hasattr(target, "request_link_idle"):
+                target.request_link_idle()
+        if (self.buffer is not None or self.song_playing) and self.player.isPlaying():
             pos = self.player.position()
-            self.current_mouth = self.envelope.at(pos)
+            frame = self.envelope.at(pos) if self.envelope else None
+            self._set_mouth(frame.mouth if frame else 0)
+            cue, end = self.envelope.subtitle_at(pos) if self.envelope else ("", self.player.duration())
+            subtitle = cue or self.pending_text
+            if subtitle and subtitle != self.subtitle:
+                target = self._get_target()
+                if target and hasattr(target, "show_bubble") and target.show_bubble(
+                        subtitle, duration_ms=max(1, end - pos), reserve=False):
+                    self.subtitle = subtitle
             self._send_clock("speaking", pos)
         else:
-            self.current_mouth = 0
+            self._set_mouth(0)
 
-    def _send_clock(self, mode: str, pos: int = 0, *, outcome=None):
-        if self.current_utterance and self.socket.state() == QAbstractSocket.SocketState.ConnectedState:
+    def _send_clock(self, mode: str, pos: int = 0, *, outcome=None, utterance=None):
+        utterance = utterance or self.current_utterance
+        if utterance and self.socket.state() == QAbstractSocket.SocketState.ConnectedState:
             payload = {
                 "event": "playback_clock",
                 "mode": mode,
-                "utteranceId": self.current_utterance,
+                "utteranceId": utterance,
                 "positionMs": pos,
                 "mouth": self.current_mouth,
             }
