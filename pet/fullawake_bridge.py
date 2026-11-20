@@ -12,10 +12,13 @@
 from __future__ import annotations
 
 import base64
+import ctypes
+from ctypes import wintypes
 import json
 import logging
 import os
 import re
+import sys
 import time
 
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QObject, QTimer, QUrl, Qt
@@ -122,10 +125,39 @@ class FullAwakePetBridge(QObject):
         else:
             self.stop_audio()
 
+    def _mark_friendly_overlay(self, target):
+        if sys.platform != "win32" or target is None:
+            return
+        widgets = []
+        if isinstance(target, QWidget):
+            widgets.append(target)
+        else:
+            for attr in ("overlay", "win"):
+                w = getattr(target, attr, None)
+                if isinstance(w, QWidget):
+                    widgets.append(w)
+            sprite = getattr(target, "sprite", None)
+            if sprite is not None and hasattr(target, "host_for_sprite"):
+                host = target.host_for_sprite(sprite)
+                for attr in ("overlay", "win"):
+                    w = getattr(host, attr, None)
+                    if isinstance(w, QWidget):
+                        widgets.append(w)
+        user32 = ctypes.windll.user32
+        for w in widgets:
+            if isValid(w):
+                try:
+                    top = w.window()
+                    if top is not None and isValid(top):
+                        user32.SetPropW(wintypes.HWND(int(top.winId())), "LucidHeart.GameWatch.PetOverlay.v1", wintypes.HANDLE(1))
+                except Exception:
+                    pass
+
     def _on_connected(self):
         self.guard.reset()
         log.info("Connected to FullAwake PC gateway (%s)", self.url.toString())
         target = self._get_target()
+        self._mark_friendly_overlay(target)
         if target and hasattr(target, "show_bubble"):
             target.show_bubble("小满已经连接到电脑桌面啦 ~", duration_ms=2500)
 
