@@ -166,6 +166,11 @@ class FullAwakePetBridge(QObject):
                 self.player.play()
         elif ev_type == "interrupt":
             self._handle_interrupt(event)
+        elif ev_type == "playback_duck":
+            utt = event.get("utteranceId")
+            vol = event.get("volume")
+            if (not utt or utt == self.current_utterance) and isinstance(vol, (int, float)):
+                self.audio.setVolume(max(0.0, min(1.0, float(vol))))
         elif (ev_type == "playback_clock" and event.get("mode") == "idle"
               and event.get("utteranceId") in ("", self.current_utterance)):
             self.stop_audio()
@@ -243,6 +248,7 @@ class FullAwakePetBridge(QObject):
             self.buffer.setData(QByteArray(wav_bytes))
             self.buffer.open(QIODevice.OpenModeFlag.ReadOnly)
             extension = "mp3" if event.get("mediaType") == "audio/mpeg" else "wav"
+            self.audio.setVolume(1.0)
             self.player.setSourceDevice(self.buffer, QUrl(f"memory.{extension}"))
             self.player.play()
         except Exception as exc:
@@ -268,6 +274,7 @@ class FullAwakePetBridge(QObject):
         if buffer is not None or song:
             self.player.stop()
             self.player.setSource(QUrl())
+        self.audio.setVolume(1.0)
         if buffer is not None:
             buffer.deleteLater()
 
