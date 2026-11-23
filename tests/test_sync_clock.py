@@ -14,12 +14,12 @@ def test_pcm_visemes_follow_media_position_and_close_at_end():
     assert [clock.at(ms).mouth for ms in (0, 19, 20, 39, 40, 0)] == [0, 0, 2, 2, 0, 0]
 
 
-def test_heartbeat_requires_negotiation_and_expires_at_five_seconds():
+def test_heartbeat_requires_negotiation_and_expires_at_fifteen_seconds():
     guard = CrashGuard()
     assert not guard.expired(100)
     guard.beat(10)
-    assert not guard.expired(14.99)
-    assert guard.expired(15)
+    assert not guard.expired(24.99)
+    assert guard.expired(25)
     guard.reset()
     assert not guard.expired(20)
 

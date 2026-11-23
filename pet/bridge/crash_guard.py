@@ -11,4 +11,4 @@ class CrashGuard:
         self.last_ping = now
 
     def expired(self, now):
-        return self.last_ping is not None and now - self.last_ping >= 5
+        return self.last_ping is not None and now - self.last_ping >= 15

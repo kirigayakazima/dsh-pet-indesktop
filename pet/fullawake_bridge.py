@@ -89,6 +89,7 @@ class FullAwakePetBridge(QObject):
         self.pending_text = ""
         self.subtitle = ""
         self.mouth_overlay = None
+        self._has_connected_once = False
 
         # 重连定时器
         self.reconnect_timer = QTimer(self)
@@ -158,8 +159,10 @@ class FullAwakePetBridge(QObject):
         log.info("Connected to FullAwake PC gateway (%s)", self.url.toString())
         target = self._get_target()
         self._mark_friendly_overlay(target)
-        if target and hasattr(target, "show_bubble"):
-            target.show_bubble("小满已经连接到电脑桌面啦 ~", duration_ms=2500)
+        if not self._has_connected_once:
+            self._has_connected_once = True
+            if target and hasattr(target, "show_bubble"):
+                target.show_bubble("小满已经连接到电脑桌面啦 ~", duration_ms=2500)
 
     def _on_disconnected(self):
         log.warning("Disconnected from FullAwake PC gateway")
